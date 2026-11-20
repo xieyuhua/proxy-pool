@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -57,6 +58,25 @@ func (t *CoreTester) Prepare(ctx context.Context) error {
 	return nil
 }
 
+// SpeedOptions 单次下载测速的参数。
+type SpeedOptions struct {
+	// Duration 最大测速时长。
+	Duration time.Duration
+	// MaxBytes 最多读取的字节数（0 表示不限制）。
+	MaxBytes int64
+	// Warmup 丢弃开头这段时间的数据（含 TLS 握手与 TCP 慢启动），让结果更接近真实带宽。
+	Warmup time.Duration
+}
+
+// testBatch 一个内核实例负责的一批节点。
+type testBatch struct {
+	index int
+	dir   string
+	inst  *coreInstance
+	nodes []*model.Node
+	err   error
+}
+
 // Test 对全部节点执行测速。
 // 若整轮探测没有任何节点成功，会先做一次自检（TCP 端口可达性 + 探测地址可达性），
 // 并在发现更合适的探测地址时自动换地址重试一轮。
@@ -77,28 +97,59 @@ func (t *CoreTester) Test(ctx context.Context, nodes []*model.Node) error {
 }
 
 // testOnce 使用指定探测地址完成一轮「延迟 + 下载」测速。
+//
+// 延迟测速按内核实例并行；等全部延迟结果出来后，再在**全局**范围内按延迟挑选下载测速候选，
+// 避免每个实例各自取前 N 个（那样 top 的实际含义会变成 实例数 × N）。
 func (t *CoreTester) testOnce(ctx context.Context, nodes []*model.Node, delayURL string) error {
 	t.resetStats()
 	batches := splitBatches(nodes, t.cfg.Concurrency)
 	t.rep.Log("INFO", "启动 %d 个内核实例并发测速，共 %d 个节点，探测地址 %s", len(batches), len(nodes), delayURL)
 
+	results := make([]*testBatch, len(batches))
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(batches))
 	for i, batch := range batches {
 		wg.Add(1)
 		go func(idx int, batch []*model.Node) {
 			defer wg.Done()
-			if err := t.runBatch(ctx, idx, batch, delayURL); err != nil {
-				errCh <- fmt.Errorf("实例%d: %w", idx+1, err)
+			res := &testBatch{index: idx, nodes: batch}
+			results[idx] = res
+			dir, err := os.MkdirTemp("", fmt.Sprintf("proxypool-%d-", idx))
+			if err != nil {
+				res.err = fmt.Errorf("实例%d: 创建临时目录失败: %w", idx+1, err)
+				return
 			}
+			res.dir = dir
+			inst, err := t.startInstance(ctx, dir, batch)
+			if err != nil {
+				res.err = fmt.Errorf("实例%d: %w", idx+1, err)
+				return
+			}
+			res.inst = inst
+			t.delayBatch(ctx, inst, batch, delayURL)
 		}(i, batch)
 	}
 	wg.Wait()
-	close(errCh)
+
+	defer func() {
+		for _, res := range results {
+			if res == nil {
+				continue
+			}
+			if res.inst != nil {
+				t.collectCoreLogs(res.inst)
+				res.inst.Stop()
+			}
+			if res.dir != "" {
+				os.RemoveAll(res.dir)
+			}
+		}
+	}()
 
 	var errs []string
-	for err := range errCh {
-		errs = append(errs, err.Error())
+	for _, res := range results {
+		if res != nil && res.err != nil {
+			errs = append(errs, res.err.Error())
+		}
 	}
 	if len(errs) > 0 && len(errs) == len(batches) {
 		return errors.New(strings.Join(errs, "; "))
@@ -106,26 +157,9 @@ func (t *CoreTester) testOnce(ctx context.Context, nodes []*model.Node, delayURL
 	for _, msg := range errs {
 		t.rep.Log("WARN", "部分批次测速失败：%s", msg)
 	}
-	return nil
-}
 
-func (t *CoreTester) runBatch(ctx context.Context, idx int, nodes []*model.Node, delayURL string) error {
-	dir, err := os.MkdirTemp("", fmt.Sprintf("proxypool-%d-", idx))
-	if err != nil {
-		return fmt.Errorf("创建临时目录失败: %w", err)
-	}
-	defer os.RemoveAll(dir)
-
-	inst, err := t.startInstance(ctx, dir, nodes)
-	if err != nil {
-		return err
-	}
-	defer inst.Stop()
-	defer t.collectCoreLogs(inst)
-
-	t.delayBatch(ctx, inst, nodes, delayURL)
-	if t.cfg.Download.Enabled {
-		t.speedBatch(ctx, inst, nodes)
+	if ctx.Err() == nil && t.cfg.Download.Enabled {
+		t.downloadPhase(ctx, results)
 	}
 	return nil
 }
@@ -183,8 +217,9 @@ func (t *CoreTester) delayBatch(ctx context.Context, inst *coreInstance, nodes [
 	wg.Wait()
 }
 
-// speedBatch 对延迟最优的节点做下载速度测试。
-func (t *CoreTester) speedBatch(ctx context.Context, inst *coreInstance, nodes []*model.Node) {
+// downloadCandidates 在全局范围内挑选下载测速候选：可用、延迟在阈值内，
+// 并按延迟从低到高截取 top / top_percent 指定的数量。
+func (t *CoreTester) downloadCandidates(nodes []*model.Node) []*model.Node {
 	candidates := make([]*model.Node, 0, len(nodes))
 	for _, n := range nodes {
 		if !n.Alive {
@@ -196,59 +231,161 @@ func (t *CoreTester) speedBatch(ctx context.Context, inst *coreInstance, nodes [
 		candidates = append(candidates, n)
 	}
 	if len(candidates) == 0 {
-		return
+		return nil
 	}
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Delay < candidates[j].Delay })
-	if t.cfg.Download.Top > 0 && len(candidates) > t.cfg.Download.Top {
-		candidates = candidates[:t.cfg.Download.Top]
+
+	limit := 0
+	if t.cfg.Download.TopPercent > 0 {
+		limit = int(math.Ceil(float64(len(candidates)) * t.cfg.Download.TopPercent / 100))
+		if limit < 1 {
+			limit = 1
+		}
 	}
+	// Top 与 TopPercent 同时配置时取更大的候选集
+	if t.cfg.Download.Top > limit {
+		limit = t.cfg.Download.Top
+	}
+	if limit > 0 && len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	return candidates
+}
+
+// downloadPhase 对全局候选节点做下载测速：把候选按延迟轮流分到各内核实例的下载组，
+// 并用一个跨实例共享的并发闸门限制同时测速的节点数（带宽有限时并发过高会互相抢带宽，
+// 让「排行」失真）。
+func (t *CoreTester) downloadPhase(ctx context.Context, results []*testBatch) {
+	alls := make([]*model.Node, 0, 64)
+	owner := map[*model.Node]*coreInstance{}
+	instances := make([]*coreInstance, 0, len(results))
+	for _, res := range results {
+		if res == nil || res.inst == nil || len(res.inst.dlGroups) == 0 {
+			continue
+		}
+		instances = append(instances, res.inst)
+		for _, n := range res.nodes {
+			owner[n] = res.inst
+		}
+		alls = append(alls, res.nodes...)
+	}
+	if len(instances) == 0 {
+		return
+	}
+	candidates := t.downloadCandidates(alls)
 	if len(candidates) == 0 {
 		return
 	}
 
-	groups := inst.dlGroups
-	if len(groups) > len(candidates) {
-		groups = groups[:len(candidates)]
+	opts := SpeedOptions{Duration: t.cfg.Download.Duration.D()}
+	if t.cfg.Download.Warmup {
+		opts.Warmup = 500 * time.Millisecond
 	}
-	if len(groups) == 0 {
-		return
+	if opts.Duration <= opts.Warmup {
+		opts.Warmup = 0
+	}
+	if t.cfg.Download.MaxSpeedMB > 0 {
+		opts.MaxBytes = int64(t.cfg.Download.MaxSpeedMB * 1000 * 1000)
+	}
+
+	// 每个实例的下载组池：同一实例内并发测速必须走不同的 select 组，
+	// 数量上限即该实例允许的下载并发数。
+	groupPool := map[*coreInstance]chan string{}
+	for _, inst := range instances {
+		pool := make(chan string, len(inst.dlGroups))
+		for _, g := range inst.dlGroups {
+			pool <- g
+		}
+		groupPool[inst] = pool
 	}
 
 	jobs := make(chan *model.Node)
+	workers := t.cfg.Download.Workers
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(candidates) {
+		workers = len(candidates)
+	}
+	t.rep.Log("INFO", "下载测速：%d 个候选节点，%d 个并发（%d 个内核实例）", len(candidates), workers, len(instances))
+
 	var wg sync.WaitGroup
 	var done int64
-	for _, group := range groups {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func(group string) {
+		go func() {
 			defer wg.Done()
 			for n := range jobs {
-				speed, err := inst.Speed(ctx, group, n.Name(), t.cfg.Download.URL, t.cfg.Download.Duration.D())
-				n.Speed = speed
-				if err != nil {
+				inst := owner[n]
+				pool := groupPool[inst]
+				var group string
+				select {
+				case group = <-pool:
+				case <-ctx.Done():
+					continue
+				}
+
+				best := 0.0
+				var lastErr error
+				attempts := 1
+				if t.cfg.Download.Retest {
+					attempts = 2
+				}
+				for attempt := 0; attempt < attempts; attempt++ {
+					speed, err := inst.Speed(ctx, group, n.Name(), t.cfg.Download.URL, opts)
+					if speed > best {
+						best = speed
+					}
+					if err != nil {
+						lastErr = err
+						if ctx.Err() != nil || speed > 0 {
+							// 测速中断但有数据：保留已测部分作为质量信息
+							break
+						}
+						continue
+					}
+					// 已经测到正常速度就不再补测，节省时间
+					if best >= 1.0 {
+						break
+					}
+					if attempt+1 < attempts {
+						t.rep.Log("DEBUG", "节点 %s 首测速度仅 %.2fMB/s，补测一次", n.Name(), best)
+					}
+				}
+				pool <- group
+
+				n.Speed = best
+				n.SpeedRank = 0
+				if lastErr != nil {
 					// 延迟探测已经证明节点可以走通外网，下载测速失败只作为质量信息，
 					// 不判定节点不可用（避免测速文件本身不可达时误杀好节点）。
-					if speed > 0 {
-						n.Error = shorten(fmt.Sprintf("测速中断: %v", err))
+					if best > 0 {
+						n.Error = shorten(fmt.Sprintf("测速中断: %v", lastErr))
 					} else {
-						n.Error = shorten(fmt.Sprintf("下载测速失败: %v", err))
+						n.Error = shorten(fmt.Sprintf("下载测速失败: %v", lastErr))
 					}
 				}
 				t.rep.Progress("下载测速", int(atomic.AddInt64(&done, 1)), len(candidates))
 			}
-		}(group)
+		}()
 	}
 
 	for _, n := range candidates {
+		if owner[n] == nil {
+			continue
+		}
 		select {
 		case jobs <- n:
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
+			model.AssignSpeedRanks(alls)
 			return
 		}
 	}
 	close(jobs)
 	wg.Wait()
+	model.AssignSpeedRanks(alls)
 }
 
 // ---------- 内核实例 ----------
@@ -307,9 +444,10 @@ func (t *CoreTester) startInstance(ctx context.Context, dir string, nodes []*mod
 		names = append(names, n.Name())
 	}
 
+	// 下载组数量决定单个内核实例内能同时跑几个下载测速，至少要能覆盖默认并发。
 	groupCount := len(nodes)
-	if groupCount > 4 {
-		groupCount = 4
+	if groupCount > 8 {
+		groupCount = 8
 	}
 	if groupCount < 1 {
 		groupCount = 1
@@ -501,9 +639,20 @@ func (c *coreInstance) Delay(ctx context.Context, node string, timeout time.Dura
 }
 
 // Speed 切换代理组到指定节点后通过混合端口下载测速，返回 MB/s。
-func (c *coreInstance) Speed(ctx context.Context, group, node, rawURL string, duration time.Duration) (float64, error) {
+//
+// 计时只在测速窗口（总时长 - 预热期）内进行：预热期用于完成 TLS 握手与 TCP 慢启动，
+// 期间的字节数不计入速度，这样更接近节点的稳定带宽，也让不同节点之间的排行更可比。
+func (c *coreInstance) Speed(ctx context.Context, group, node, rawURL string, opts SpeedOptions) (float64, error) {
+	duration := opts.Duration
 	if duration <= 0 {
 		duration = 5 * time.Second
+	}
+	warmup := opts.Warmup
+	if warmup < 0 {
+		warmup = 0
+	}
+	if warmup >= duration {
+		warmup = 0
 	}
 	if err := c.selectProxy(ctx, group, node); err != nil {
 		return 0, err
@@ -516,8 +665,8 @@ func (c *coreInstance) Speed(ctx context.Context, group, node, rawURL string, du
 		return 0, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept-Encoding", "identity")
 
-	start := time.Now()
 	resp, err := c.pxClient.Do(req)
 	if err != nil {
 		if reqCtx.Err() != nil {
@@ -529,27 +678,62 @@ func (c *coreInstance) Speed(ctx context.Context, group, node, rawURL string, du
 	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("下载返回 HTTP %d", resp.StatusCode)
 	}
+	bodyStart := time.Now()
 
+	windowStart := bodyStart.Add(warmup)
 	buf := make([]byte, 128*1024)
-	var total int64
+	var total, counted int64
+	var firstCounted, lastCounted time.Time
 	for {
 		n, err := resp.Body.Read(buf)
-		total += int64(n)
-		if err != nil {
-			break
+		now := time.Now()
+		if n > 0 {
+			total += int64(n)
+			// 预热期内的字节不计入速度
+			if !now.Before(windowStart) {
+				if firstCounted.IsZero() {
+					firstCounted = now
+				}
+				lastCounted = now
+				counted += int64(n)
+			}
+			if opts.MaxBytes > 0 && counted >= opts.MaxBytes {
+				break
+			}
 		}
-		if reqCtx.Err() != nil {
+		if err != nil || reqCtx.Err() != nil {
 			break
 		}
 	}
-	elapsed := time.Since(start).Seconds()
-	if total == 0 || elapsed <= 0 {
+
+	var elapsed float64
+	if counted > 0 {
+		elapsed = lastCounted.Sub(firstCounted).Seconds()
+		if elapsed <= 0 {
+			elapsed = time.Since(windowStart).Seconds()
+		}
+	}
+	if counted == 0 {
+		// 数据在预热窗口内就读完了（小文件或本机回环）：退回使用全部字节与总耗时。
+		if total > 0 {
+			return float64(total) / safeElapsed(time.Since(bodyStart).Seconds()) / 1000 / 1000, nil
+		}
 		if reqCtx.Err() != nil {
 			return 0, errors.New("下载超时且无数据")
 		}
 		return 0, errors.New("未获取到数据")
 	}
-	return float64(total) / elapsed / 1000 / 1000, nil
+	return float64(counted) / safeElapsed(elapsed) / 1000 / 1000, nil
+}
+
+// safeElapsed 给计时结果一个下限：Windows 上 time.Now 分辨率较粗，
+// 极快完成的读循环可能得到 0，直接相除会得到 0 或 Inf 之类的错误结果。
+func safeElapsed(seconds float64) float64 {
+	const minElapsed = 1e-6 // 1µs
+	if seconds < minElapsed {
+		return minElapsed
+	}
+	return seconds
 }
 
 func (c *coreInstance) selectProxy(ctx context.Context, group, node string) error {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,6 +105,13 @@ func (r *Runner) Last() *Snapshot {
 	return r.last
 }
 
+// Seed 直接注入一份结果快照（仅用于测试与离线预览）。
+func (r *Runner) Seed(snap *Snapshot) {
+	r.mu.Lock()
+	r.last = snap
+	r.mu.Unlock()
+}
+
 func (r *Runner) setStage(stage string) {
 	r.mu.Lock()
 	r.progress.Stage = stage
@@ -166,7 +174,7 @@ func (r *Runner) Run(ctx context.Context, trigger string, opts Options) (*Snapsh
 		r.logf("INFO", "复用上次节点池（%d 个节点），仅重新测速", len(lastSnapshot.Nodes))
 		nodes = lastSnapshot.Nodes
 		for _, n := range nodes {
-			n.Delay, n.Speed, n.Alive, n.Error = -1, 0, false, ""
+			n.Delay, n.Speed, n.SpeedRank, n.Alive, n.Error = -1, 0, 0, false, ""
 		}
 	} else {
 		// 1) 拉取订阅
@@ -238,6 +246,20 @@ func (r *Runner) Run(ctx context.Context, trigger string, opts Options) (*Snapsh
 		alive = alive[:cfg.Pool.MaxNodes]
 	}
 	snap.Active = len(alive)
+
+	if cfg.SpeedTest.Download.Enabled {
+		top := alive
+		if len(top) > 3 {
+			top = top[:3]
+		}
+		if summary := speedSummary(top); summary != "" {
+			if cfg.Pool.SortBy == config.SortBySpeed {
+				r.logf("INFO", "写入配置的节点按下载速度排行排序，前几名：%s", summary)
+			} else {
+				r.logf("INFO", "下载速度排行前几名：%s", summary)
+			}
+		}
+	}
 
 	outputPath := r.store.ResolvePath(cfg.Output.Path)
 	templatePath := ""
@@ -333,8 +355,26 @@ func filterAlive(nodes []*model.Node, cfg *config.Config) []*model.Node {
 		}
 		alive = append(alive, n)
 	}
-	model.SortByQuality(alive)
+	// 排行只在最终可用节点中计算，避免被筛掉的节点占用名次
+	model.AssignSpeedRanks(alive)
+	if strings.EqualFold(cfg.Pool.SortBy, config.SortBySpeed) {
+		model.SortBySpeed(alive)
+	} else {
+		model.SortByQuality(alive)
+	}
 	return alive
+}
+
+// speedSummary 生成「#1 🇭🇰HK-001 12.34MB/s」形式的排行摘要。
+func speedSummary(nodes []*model.Node) string {
+	parts := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n.Speed <= 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("#%d %s %.2fMB/s", n.SpeedRank, n.Name(), n.Speed))
+	}
+	return strings.Join(parts, "、")
 }
 
 // taskReporter 把测速过程转发到日志与进度。

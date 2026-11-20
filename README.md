@@ -94,6 +94,43 @@ speedtest:
 只做 TCP 握手探测，无需内核，速度快，但**只能证明端口可达**，不能证明代理可用。
 当 core 模式不可用（内核下载失败、启动失败）时会自动回落到该模式，并在日志中给出警告。
 
+### 下载测速与速度排行
+
+每个节点在延迟测速通过后，内核会把它切到一个独立的 select 组，从混合端口真实下载测速文件并计算 MB/s。
+为了让它既能反映真实带宽、又能横向比较，测速过程做了几件事：
+
+1. **全局挑选候选**：等所有内核实例的延迟结果都出来以后，在**整个节点池**里按延迟从低到高挑出前
+   `download.top` 个（或前 `download.top_percent`%）做下载测速。不会出现「每个实例各测 N 个」的情况。
+2. **丢弃预热数据**：默认丢弃前 500ms（TLS 握手 + TCP 慢启动）再开始计时，避免把握手时间算进速度。
+3. **限流并发**：`download.workers` 是跨所有内核实例共享的并发数，避免同时测速的节点过多互相抢带宽。
+4. **自动补测**：首测低于 1MB/s 时会再测一次取较高值（`download.retest`），降低瞬时抖动对排行的影响。
+5. **速度排行**：全部测速结束后，按速度从高到低分配名次 `speed_rank`（同速度共享名次），
+   并可通过 `pool.sort_by: speed` 让**写入配置的节点顺序**也按速度排行排列。
+
+排行可以在两个地方看到：
+
+- 管理页面「速度排行」标签页（前三名有奖牌标记，可按前 N 名过滤）
+- 接口 `GET /api/ranking?top=20`，返回名次、节点、速度、延迟、来源
+
+```json
+{
+  "entries": [
+    {"rank": 1, "name": "🇭🇰HK-003", "region": "香港", "type": "vmess",
+     "endpoint": "hk3.example.com:443", "speed_mb": 42.18, "delay_ms": 38, "source": "机场 A"}
+  ],
+  "count": 1,
+  "engine": "core"
+}
+```
+
+每轮任务结束时日志里也会打印排行前列的节点，例如：
+
+```
+[INFO] 下载速度排行前几名：#1 🇭🇰HK-003 42.18MB/s、#2 🇯🇵JP-001 28.60MB/s、#3 🇸🇬SG-002 17.02MB/s
+```
+
+注意：`tcp` 模式只测端口可达性，不产生速度，因此排行会是空的。
+
 ### 全部节点探测失败时的自检
 
 如果一整轮探测下来**没有任何节点成功**，程序会自动做一次自检并把结论写进日志：
@@ -201,7 +238,8 @@ scheduler:
 | GET | `/` | 可视化管理页面 |
 | GET | `/clash.yaml`、`/sub`、`/api/clash` | 生成的 Clash 配置文件 |
 | GET | `/api/status` | 运行状态、进度、上次生成统计、输出文件信息 |
-| GET | `/api/nodes?all=1` | 节点池明细（`all=1` 时包含不可用节点） |
+| GET | `/api/nodes?all=1&sort=speed` | 节点池明细（`all=1` 包含不可用节点，`sort=speed` 按速度排行排序） |
+| GET | `/api/ranking?top=N` | 下载速度排行（只含测出速度的可用节点，`top` 限制返回条数） |
 | GET | `/api/logs?since=N` | 增量拉取运行日志 |
 | GET / PUT | `/api/config` | 读取 / 局部更新配置 |
 | POST | `/api/reload` | 重新从磁盘加载配置文件 |
@@ -223,6 +261,12 @@ scheduler:
 | `speedtest.max_delay` | 延迟上限（毫秒），超过即判定不可用 |
 | `speedtest.download.min_speed_mb` | 下载速度下限（MB/s），低于即判定不可用 |
 | `speedtest.download.top` | 只对延迟最优的前 N 个节点做下载测速，兼顾耗时 |
+| `speedtest.download.top_percent` | 只对延迟最优的前 N% 节点做下载测速（与 `top` 取更大者） |
+| `speedtest.download.workers` | 跨实例共享的下载测速并发数，过高会互相抢带宽让排行失真 |
+| `speedtest.download.warmup` | 丢弃前 500ms 数据（握手 + 慢启动），结果更接近真实带宽 |
+| `speedtest.download.retest` | 首测偏低时补测一次取较高值 |
+| `speedtest.download.max_speed_mb` | 单次读取上限（MB），避免高速节点一直下载到时长结束 |
+| `pool.sort_by` | `delay`（按延迟）或 `speed`（按下载速度排行，未测出速度的排后面） |
 | `pool.max_nodes` | 最终写入配置的节点数上限 |
 | `output.template` | 自定义 Clash 模板，代理组里用 `__NODES__` 代表全部节点 |
 | `scheduler.interval` | 定时自动生成间隔 |

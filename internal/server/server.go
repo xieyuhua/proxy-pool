@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -78,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/run", s.guard(s.handleRun))
 	mux.HandleFunc("POST /api/probe", s.guard(s.handleProbe))
 	mux.HandleFunc("GET /api/nodes", s.guard(s.handleNodes))
+	mux.HandleFunc("GET /api/ranking", s.guard(s.handleRanking))
 	mux.HandleFunc("GET /api/logs", s.guard(s.handleLogs))
 	mux.HandleFunc("GET /api/output", s.guard(s.handleClash))
 
@@ -196,7 +198,11 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	nodes := make([]*model.Node, len(snap.Nodes))
 	copy(nodes, snap.Nodes)
-	model.SortByQuality(nodes)
+	if strings.EqualFold(r.URL.Query().Get("sort"), config.SortBySpeed) {
+		model.SortBySpeed(nodes)
+	} else {
+		model.SortByQuality(nodes)
+	}
 	if r.URL.Query().Get("all") == "" {
 		alive := nodes[:0]
 		for _, n := range nodes {
@@ -218,6 +224,74 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		"dropped":       snap.Dropped,
 		"subscriptions": snap.Subscriptions,
 	})
+}
+
+// speedRankEntry 下载速度排行的一项。
+type speedRankEntry struct {
+	Rank        int     `json:"rank"`
+	Name        string  `json:"name"`
+	Region      string  `json:"region"`
+	RegionEmoji string  `json:"region_emoji"`
+	Type        string  `json:"type"`
+	Endpoint    string  `json:"endpoint"`
+	SpeedMB     float64 `json:"speed_mb"`
+	DelayMS     int     `json:"delay_ms"`
+	Source      string  `json:"source"`
+}
+
+// handleRanking 返回下载速度排行（按速度从高到低）。
+func (s *Server) handleRanking(w http.ResponseWriter, r *http.Request) {
+	snap := s.runner.Last()
+	entries := []speedRankEntry{}
+	top := 0
+	if v, err := strconv.Atoi(r.URL.Query().Get("top")); err == nil && v > 0 {
+		top = v
+	}
+	if snap != nil {
+		nodes := make([]*model.Node, len(snap.Nodes))
+		copy(nodes, snap.Nodes)
+		model.AssignSpeedRanks(nodes)
+		model.SortBySpeed(nodes)
+		for _, n := range nodes {
+			if !n.Alive || n.Speed <= 0 {
+				continue
+			}
+			if top > 0 && len(entries) >= top {
+				break
+			}
+			entries = append(entries, speedRankEntry{
+				Rank:        n.SpeedRank,
+				Name:        n.Name(),
+				Region:      n.Region,
+				RegionEmoji: n.Emoji,
+				Type:        n.Type(),
+				Endpoint:    n.Endpoint(),
+				SpeedMB:     math.Round(n.Speed*100) / 100,
+				DelayMS:     n.Delay,
+				Source:      n.Source,
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": entries,
+		"count":   len(entries),
+		"at":      snapshotTime(snap),
+		"engine":  engineOf(snap),
+	})
+}
+
+func snapshotTime(snap *runner.Snapshot) any {
+	if snap == nil {
+		return nil
+	}
+	return snap.At.Format("2006-01-02 15:04:05")
+}
+
+func engineOf(snap *runner.Snapshot) string {
+	if snap == nil {
+		return ""
+	}
+	return snap.Engine
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {

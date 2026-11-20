@@ -67,7 +67,9 @@ func (t *TCPTester) Test(ctx context.Context, nodes []*model.Node) error {
 					n.Delay = delay
 					n.Alive = true
 					n.Error = ""
+					// TCP 模式不测速，速度与排行都按「未测」处理
 					n.Speed = 0
+					n.SpeedRank = 0
 				}
 				t.rep.Progress("TCP 探测", int(atomic.AddInt64(&done, 1)), len(candidates))
 			}

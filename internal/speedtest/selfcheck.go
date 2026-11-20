@@ -163,7 +163,7 @@ func countAlive(nodes []*model.Node) int {
 
 func resetNodes(nodes []*model.Node) {
 	for _, n := range nodes {
-		n.Delay, n.Speed, n.Alive, n.Error = -1, 0, false, ""
+		n.Delay, n.Speed, n.SpeedRank, n.Alive, n.Error = -1, 0, 0, false, ""
 	}
 }
 

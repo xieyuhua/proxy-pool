@@ -20,6 +20,11 @@ const (
 	ModeCore = "core"
 	// ModeTCP 仅做 TCP 连通性测试（无需内核，但只代表端口可达）。
 	ModeTCP = "tcp"
+
+	// SortByDelay 按延迟排序（默认）。
+	SortByDelay = "delay"
+	// SortBySpeed 按下载速度排行排序，未测出速度的节点排在后面。
+	SortBySpeed = "speed"
 )
 
 // Duration 兼容 "30s" / "5m" / "2h" / 90（秒）三种写法。
@@ -115,6 +120,8 @@ type PoolConfig struct {
 	MaxNodes int `yaml:"max_nodes" json:"max_nodes"`
 	// Dedupe 是否按服务器/端口/凭据去重。
 	Dedupe bool `yaml:"dedupe" json:"dedupe"`
+	// SortBy 排序方式：delay（按延迟，默认）或 speed（按下载速度排行）。
+	SortBy string `yaml:"sort_by,omitempty" json:"sort_by,omitempty"`
 	// DropTypes 丢弃的协议类型。为空时使用内置黑名单（不支持的协议）。
 	DropTypes []string `yaml:"drop_types,omitempty" json:"drop_types,omitempty"`
 }
@@ -129,8 +136,19 @@ type DownloadConfig struct {
 	Duration Duration `yaml:"duration" json:"duration"`
 	// Top 只对延迟最优的前 N 个节点做下载测速，0 表示全部。
 	Top int `yaml:"top" json:"top"`
+	// TopPercent 只对延迟最优的前 N% 节点做下载测速，0 表示不启用。
+	// 与 Top 同时配置时取两者中更大的候选集。
+	TopPercent float64 `yaml:"top_percent,omitempty" json:"top_percent,omitempty"`
 	// MinSpeedMB 最低速度要求（MB/s），低于该值判定不可用，0 表示不限制。
 	MinSpeedMB float64 `yaml:"min_speed_mb" json:"min_speed_mb"`
+	// MaxSpeedMB 给测速文件设置读取上限（MB），避免带宽充足时一直下载到时长结束；0 表示不限制。
+	MaxSpeedMB float64 `yaml:"max_speed_mb,omitempty" json:"max_speed_mb,omitempty"`
+	// Warmup 是否丢弃前 500ms 的数据（含 TLS 握手与慢启动），让速度更接近真实带宽。
+	Warmup bool `yaml:"warmup,omitempty" json:"warmup,omitempty"`
+	// Workers 允许同时做下载测速的节点数（跨内核实例共享），0 使用内置默认值。
+	Workers int `yaml:"workers,omitempty" json:"workers,omitempty"`
+	// Retest 测速结果明显偏低时是否补测一次并取较高值。
+	Retest bool `yaml:"retest,omitempty" json:"retest,omitempty"`
 }
 
 // CoreConfig mihomo/clash 内核配置。
@@ -226,6 +244,7 @@ func Default() *Config {
 			NameFormat: "{emoji}{code}-{index:03d}",
 			MaxNodes:   300,
 			Dedupe:     true,
+			SortBy:     SortByDelay,
 		},
 		SpeedTest: SpeedTestConfig{
 			Mode:         ModeCore,
@@ -241,6 +260,10 @@ func Default() *Config {
 				Duration:   Duration(6 * time.Second),
 				Top:        30,
 				MinSpeedMB: 0.3,
+				MaxSpeedMB: 64,
+				Warmup:     true,
+				Workers:    8,
+				Retest:     true,
 			},
 			Core: CoreConfig{
 				Path:         defaultCorePath(),
@@ -287,6 +310,12 @@ func (c *Config) Normalize() {
 	}
 	if strings.TrimSpace(c.Pool.NameFormat) == "" {
 		c.Pool.NameFormat = def.Pool.NameFormat
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Pool.SortBy)) {
+	case SortBySpeed:
+		c.Pool.SortBy = SortBySpeed
+	default:
+		c.Pool.SortBy = SortByDelay
 	}
 	if strings.TrimSpace(c.Output.Path) == "" {
 		c.Output.Path = def.Output.Path
@@ -353,6 +382,21 @@ func (c *Config) Normalize() {
 		}
 		if st.Download.Top < 0 {
 			st.Download.Top = 0
+		}
+		if st.Download.TopPercent < 0 {
+			st.Download.TopPercent = 0
+		}
+		if st.Download.TopPercent > 100 {
+			st.Download.TopPercent = 100
+		}
+		if st.Download.MaxSpeedMB < 0 {
+			st.Download.MaxSpeedMB = 0
+		}
+		if st.Download.Workers < 0 {
+			st.Download.Workers = 0
+		}
+		if st.Download.MinSpeedMB < 0 {
+			st.Download.MinSpeedMB = 0
 		}
 	}
 	if strings.TrimSpace(st.Core.Path) == "" {

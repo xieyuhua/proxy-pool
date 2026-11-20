@@ -5,6 +5,7 @@ package model
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,8 @@ type Node struct {
 	Delay int `json:"delay"`
 	// Speed 下载速度（MB/s）。
 	Speed float64 `json:"speed"`
+	// SpeedRank 下载速度排名（1 开始；未测到有效速度的节点为 0）。
+	SpeedRank int `json:"speed_rank"`
 	// Alive 是否可用。
 	Alive bool `json:"alive"`
 	// Error 测速失败原因。
@@ -190,6 +193,29 @@ func GetBool(m map[string]any, key string) bool {
 	return false
 }
 
+// AssignSpeedRanks 按下载速度从高到低为节点分配排行（1 开始）。
+// 不可用节点与没有有效速度（未测或测速失败）的节点排行为 0；速度相同的节点共享同一名次。
+func AssignSpeedRanks(nodes []*Node) {
+	ranked := make([]*Node, 0, len(nodes))
+	for _, n := range nodes {
+		n.SpeedRank = 0
+		if n.Alive && n.Speed > 0 {
+			ranked = append(ranked, n)
+		}
+	}
+	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].Speed > ranked[j].Speed })
+	rank := 0
+	last := -1.0
+	for i, n := range ranked {
+		speed := math.Round(n.Speed*100) / 100
+		if i == 0 || speed != last {
+			rank = i + 1
+			last = speed
+		}
+		n.SpeedRank = rank
+	}
+}
+
 // SortByQuality 按「可用 > 延迟 > 速度」排序。
 func SortByQuality(nodes []*Node) {
 	sort.SliceStable(nodes, func(i, j int) bool {
@@ -208,5 +234,31 @@ func SortByQuality(nodes []*Node) {
 			return ad < bd
 		}
 		return a.Speed > b.Speed
+	})
+}
+
+// SortBySpeed 按「可用 > 下载速度排行 > 延迟」排序。
+// 未测到速度的节点排在已测速节点之后。
+func SortBySpeed(nodes []*Node) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		a, b := nodes[i], nodes[j]
+		if a.Alive != b.Alive {
+			return a.Alive
+		}
+		aRanked, bRanked := a.SpeedRank > 0, b.SpeedRank > 0
+		if aRanked != bRanked {
+			return aRanked
+		}
+		if aRanked && a.SpeedRank != b.SpeedRank {
+			return a.SpeedRank < b.SpeedRank
+		}
+		ad, bd := a.Delay, b.Delay
+		if ad <= 0 {
+			ad = 1 << 30
+		}
+		if bd <= 0 {
+			bd = 1 << 30
+		}
+		return ad < bd
 	})
 }

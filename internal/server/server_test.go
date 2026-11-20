@@ -16,6 +16,7 @@ import (
 
 	"proxypool/internal/config"
 	"proxypool/internal/logx"
+	"proxypool/internal/model"
 	"proxypool/internal/runner"
 )
 
@@ -157,6 +158,107 @@ func TestRunAPIBackgroundTask(t *testing.T) {
 	if nodes.Total != 1 || nodes.Alive != 1 {
 		t.Fatalf("节点统计异常: total=%d alive=%d", nodes.Total, nodes.Alive)
 	}
+}
+
+// 覆盖「下载速度排行」接口：只返回测出速度的可用节点，且按速度从高到低。
+func TestRankingAPI(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Server.Listen = "127.0.0.1:0"
+	cfg.SpeedTest.Mode = config.ModeTCP
+	cfg.SpeedTest.Download.Enabled = false
+	cfg.Scheduler.Enabled = false
+	data, _ := yaml.Marshal(cfg)
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := runner.New(store, logx.New(20, nil))
+	// 直接注入一份快照，绕开真实测速
+	snap := &runner.Snapshot{
+		At:     time.Now(),
+		Engine: config.ModeCore,
+		Nodes: []*model.Node{
+			rankNode("slow", 100, 1.5),
+			rankNode("fast", 500, 30.0),
+			rankNode("mid", 200, 8.0),
+			rankNode("dead", 30, 99.0),
+			rankNode("untested", 40, 0),
+		},
+	}
+	snap.Nodes[3].Alive = false
+	r.Seed(snap)
+
+	srv, err := New(store, r, logx.New(20, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	var resp struct {
+		Entries []struct {
+			Rank    int     `json:"rank"`
+			Name    string  `json:"name"`
+			SpeedMB float64 `json:"speed_mb"`
+		} `json:"entries"`
+		Count int `json:"count"`
+	}
+	body, err := http.Get(ts.URL + "/api/ranking")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Body.Close()
+	if err := json.NewDecoder(body.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Count != 3 {
+		t.Fatalf("应只包含 3 个有速度的可用节点，实际 %d（%+v）", resp.Count, resp.Entries)
+	}
+	want := []string{"fast", "mid", "slow"}
+	for i, name := range want {
+		if resp.Entries[i].Name != name {
+			t.Fatalf("第 %d 名应为 %s，实际 %s", i+1, name, resp.Entries[i].Name)
+		}
+		if resp.Entries[i].Rank != i+1 {
+			t.Fatalf("第 %d 名排行号错误: %d", i+1, resp.Entries[i].Rank)
+		}
+	}
+	if resp.Entries[0].SpeedMB != 30 {
+		t.Fatalf("速度值错误: %v", resp.Entries[0].SpeedMB)
+	}
+
+	// top 参数限制返回数量
+	body2, err := http.Get(ts.URL + "/api/ranking?top=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body2.Body.Close()
+	var resp2 struct {
+		Count int `json:"count"`
+	}
+	if err := json.NewDecoder(body2.Body).Decode(&resp2); err != nil {
+		t.Fatal(err)
+	}
+	if resp2.Count != 1 {
+		t.Fatalf("top=1 应只返回 1 条，实际 %d", resp2.Count)
+	}
+}
+
+func rankNode(name string, delay int, speed float64) *model.Node {
+	n := model.New(map[string]any{
+		"name":   name,
+		"type":   "ss",
+		"server": "127.0.0.1",
+		"port":   443,
+	})
+	n.Delay, n.Speed, n.Alive = delay, speed, true
+	n.Region, n.RegionCode, n.Emoji = "测试", "ZZ", "🏳️"
+	return n
 }
 
 func TestTokenGuard(t *testing.T) {

@@ -118,6 +118,7 @@
     <button class="tab" data-tab="subs">订阅地址</button>
     <button class="tab" data-tab="settings">测速设置</button>
     <button class="tab" data-tab="nodes">节点池</button>
+    <button class="tab" data-tab="ranking">速度排行</button>
     <button class="tab" data-tab="logs">运行日志</button>
   </nav>
 </header>
@@ -225,6 +226,30 @@
           <div class="setting-control"><input name="download_top" type="number" min="0"></div>
         </div>
         <div class="setting">
+          <div class="setting-info"><strong>下载测速节点比例</strong><span>只对延迟最优的前 N% 节点测速，0 表示不启用；与上一项同时配置时取更大的候选集</span></div>
+          <div class="setting-control"><input name="download_top_percent" type="number" step="1" min="0" max="100"></div>
+        </div>
+        <div class="setting">
+          <div class="setting-info"><strong>下载并发数</strong><span>同时测速的节点数；带宽有限时并发过高会让排行失真</span></div>
+          <div class="setting-control"><input name="download_workers" type="number" min="1" max="64"></div>
+        </div>
+        <div class="setting">
+          <div class="setting-info"><strong>丢弃预热数据</strong><span>丢弃前 500ms（含 TLS 握手与慢启动），结果更接近真实带宽</span></div>
+          <div class="setting-control">
+            <label class="switch"><input name="download_warmup" type="checkbox"><i></i></label>
+          </div>
+        </div>
+        <div class="setting">
+          <div class="setting-info"><strong>测速结果补测</strong><span>首测速度偏低时再测一次并取较高值，避免排行被瞬时抖动影响</span></div>
+          <div class="setting-control">
+            <label class="switch"><input name="download_retest" type="checkbox"><i></i></label>
+          </div>
+        </div>
+        <div class="setting">
+          <div class="setting-info"><strong>单次读取上限</strong><span>MB，避免高速节点一直下载到时长结束；0 表示不限制</span></div>
+          <div class="setting-control"><input name="download_max_mb" type="number" step="1" min="0"></div>
+        </div>
+        <div class="setting">
           <div class="setting-info"><strong>最低速度</strong><span>MB/s，低于该值判为不可用，0 表示不限制</span></div>
           <div class="setting-control"><input name="min_speed_mb" type="number" step="0.1" min="0"></div>
         </div>
@@ -233,6 +258,15 @@
         <div class="setting">
           <div class="setting-info"><strong>节点池上限</strong><span>最终写入配置的节点数量上限，0 表示不限制</span></div>
           <div class="setting-control"><input name="max_nodes" type="number" min="0"></div>
+        </div>
+        <div class="setting">
+          <div class="setting-info"><strong>节点排序方式</strong><span>delay：按延迟；speed：按下载速度排行（未测出速度的节点排后面）。写入配置的订阅顺序也随之变化</span></div>
+          <div class="setting-control">
+            <select name="sort_by">
+              <option value="delay">delay（按延迟）</option>
+              <option value="speed">speed（按下载速度排行）</option>
+            </select>
+          </div>
         </div>
         <div class="setting">
           <div class="setting-info"><strong>输出文件路径</strong><span>同时作为订阅地址对外提供</span></div>
@@ -284,6 +318,28 @@
     </div>
   </section>
 
+  <!-- ============ 速度排行 ============ -->
+  <section class="panel" data-panel="ranking">
+    <div class="card">
+      <h2>下载速度排行 <span class="hint" id="rankHint">按实测下载速度从高到低排序</span></h2>
+      <div class="form-row">
+        <input id="rankTop" type="number" min="0" placeholder="只显示前 N 名（0 表示全部）" style="flex:0 0 240px">
+        <button class="btn" id="btnRefreshRank">刷新排行</button>
+        <span class="hint">只有实际测到速度的节点会出现在排行里；TCP 模式下没有排行</span>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr>
+            <th style="width:70px">名次</th><th style="width:210px">节点</th><th style="width:70px">地区</th>
+            <th style="width:80px">类型</th><th style="width:110px">下载速度</th><th style="width:90px">延迟</th>
+            <th>来源</th><th style="width:80px">操作</th>
+          </tr></thead>
+          <tbody id="rankBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ 节点池 ============ -->
   <section class="panel" data-panel="nodes">
     <div class="card">
@@ -300,7 +356,8 @@
         <table>
           <thead><tr>
             <th style="width:210px">节点</th><th style="width:70px">地区</th><th style="width:80px">类型</th>
-            <th style="width:80px">延迟</th><th style="width:100px">速度</th><th>来源</th><th style="width:150px">状态</th><th style="width:80px">操作</th>
+            <th style="width:80px">延迟</th><th style="width:100px">速度</th><th style="width:70px">速度排名</th>
+            <th>来源</th><th style="width:150px">状态</th><th style="width:80px">操作</th>
           </tr></thead>
           <tbody id="nodeBody"></tbody>
         </table>
@@ -362,6 +419,7 @@ function activateTab(name, remember) {
   if (remember) history.replaceState(null, '', '#' + name);
   // 仅在切换时按需拉取数据，避免覆盖正在编辑的设置表单
   if (name === 'nodes') loadNodes();
+  if (name === 'ranking') loadRanking();
   if (name === 'logs') pollLogs();
 }
 document.querySelectorAll('.tab').forEach((btn) => {
@@ -408,7 +466,7 @@ async function refreshStatus() {
     }
 
     renderStats(data);
-    if (wasRunning && !running) { loadNodes(); }
+    if (wasRunning && !running) { loadNodes(); loadRanking(); }
     wasRunning = running;
   } catch (e) { /* 忽略瞬时错误 */ }
 }
@@ -530,8 +588,14 @@ async function loadConfig() {
   f.download_url.value = c.speedtest.download.url;
   f.download_duration.value = c.speedtest.download.duration;
   f.download_top.value = c.speedtest.download.top;
+  f.download_top_percent.value = c.speedtest.download.top_percent || 0;
+  f.download_workers.value = c.speedtest.download.workers || 8;
+  f.download_warmup.checked = !!c.speedtest.download.warmup;
+  f.download_retest.checked = !!c.speedtest.download.retest;
+  f.download_max_mb.value = c.speedtest.download.max_speed_mb || 0;
   f.min_speed_mb.value = c.speedtest.download.min_speed_mb;
   f.download_enabled.checked = !!c.speedtest.download.enabled;
+  f.sort_by.value = c.pool.sort_by || 'delay';
   f.interval.value = c.scheduler.interval;
   f.cron.value = c.scheduler.cron || '';
   f.timezone.value = c.scheduler.timezone || '';
@@ -546,7 +610,7 @@ async function loadConfig() {
 $('#btnSaveCfg').addEventListener('click', async () => {
   const f = $('#cfgForm');
   const patch = {
-    pool: { max_nodes: Number(f.max_nodes.value) || 0 },
+    pool: { max_nodes: Number(f.max_nodes.value) || 0, sort_by: f.sort_by.value },
     speedtest: {
       mode: f.mode.value,
       concurrency: Number(f.concurrency.value) || 4,
@@ -558,6 +622,11 @@ $('#btnSaveCfg').addEventListener('click', async () => {
         url: f.download_url.value,
         duration: f.download_duration.value,
         top: Number(f.download_top.value) || 0,
+        top_percent: Number(f.download_top_percent.value) || 0,
+        workers: Number(f.download_workers.value) || 8,
+        warmup: f.download_warmup.checked,
+        retest: f.download_retest.checked,
+        max_speed_mb: Number(f.download_max_mb.value) || 0,
         min_speed_mb: Number(f.min_speed_mb.value) || 0,
       },
     },
@@ -634,18 +703,60 @@ async function loadNodes() {
   } catch (e) { /* 忽略 */ }
 }
 
+/* ---------- 速度排行 ---------- */
+let rankCache = [];
+async function loadRanking() {
+  try {
+    const top = Number($('#rankTop').value) || 0;
+    const data = await api('/api/ranking' + (top > 0 ? '?top=' + top : ''));
+    rankCache = data.entries || [];
+    $('#rankHint').textContent = data.at
+      ? `共 ${data.count || 0} 个测出速度的节点 · 更新时间 ${data.at}`
+      : '尚无测速数据，请先执行一次「立即测速生成」';
+    renderRanking();
+  } catch (e) { /* 忽略 */ }
+}
+
+function renderRanking() {
+  const body = $('#rankBody');
+  if (!rankCache.length) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">还没有测出速度的节点（TCP 模式下不做下载测速）</td></tr>';
+    return;
+  }
+  const medal = (r) => (r === 1 ? '🥇' : r === 2 ? '🥈' : r === 3 ? '🥉' : r);
+  body.innerHTML = rankCache.map((e) => `<tr>
+      <td><strong>${medal(e.rank)}</strong></td>
+      <td>${esc(e.region_emoji || '')} ${esc(e.name)}<div class="suburl">${esc(e.endpoint)}</div></td>
+      <td>${esc(e.region)}</td>
+      <td><span class="tag">${esc(e.type)}</span></td>
+      <td><strong class="ok">${e.speed_mb.toFixed(2)}</strong> MB/s</td>
+      <td>${e.delay_ms > 0 ? e.delay_ms + ' ms' : '-'}</td>
+      <td class="muted">${esc(e.source)}</td>
+      <td><button class="btn mini" data-probe="${esc(e.name)}">测试</button></td>
+    </tr>`).join('');
+}
+
+$('#btnRefreshRank').addEventListener('click', loadRanking);
+$('#rankTop').addEventListener('change', loadRanking);
+$('#rankBody').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-probe]');
+  if (!btn) return;
+  probeNode(btn.dataset.probe, btn);
+});
+
 function renderNodes() {
   const kw = $('#nodeSearch').value.trim().toLowerCase();
   const list = nodeCache.filter((n) =>
     !kw || (n.raw.name || '').toLowerCase().includes(kw) || (n.raw.server || '').toLowerCase().includes(kw));
   const body = $('#nodeBody');
   if (!list.length) {
-    body.innerHTML = '<tr><td colspan="8" class="empty">暂无节点数据，点击「立即测速生成」开始</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="empty">暂无节点数据，点击「立即测速生成」开始</td></tr>';
     return;
   }
   body.innerHTML = list.slice(0, 800).map((n) => {
     const delay = n.delay > 0 ? n.delay + ' ms' : '-';
     const speed = n.speed > 0 ? n.speed.toFixed(2) + ' MB/s' : '-';
+    const rank = n.speed_rank > 0 ? '#' + n.speed_rank : '-';
     const status = n.alive
       ? '<span class="ok">可用</span>'
       : '<span class="bad">不可用</span>' + (n.error ? ' <span class="muted">' + esc(n.error) + '</span>' : '');
@@ -655,6 +766,7 @@ function renderNodes() {
       <td><span class="tag">${esc(n.raw.type)}</span></td>
       <td>${delay}</td>
       <td>${speed}</td>
+      <td>${rank}</td>
       <td class="muted">${esc(n.source)}</td>
       <td>${status}</td>
       <td><button class="btn mini" data-probe="${esc(n.raw.name)}">测试</button></td>
@@ -722,6 +834,7 @@ async function pollLogs() {
   await loadConfig();
   await loadSubs();
   await loadNodes();
+  await loadRanking();
   await refreshStatus();
   await pollLogs();
   activateTab((location.hash || '#home').slice(1), false);
